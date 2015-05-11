@@ -19,11 +19,13 @@ import (
 	"unicode"
 
 	"code.google.com/p/go.net/publicsuffix"
+	"github.com/garyburd/go-oauth/oauth"
 	"github.com/juju/loggo"
 	"github.com/juju/persistent-cookiejar"
 	"gopkg.in/macaroon-bakery.v0/httpbakery"
 	flag "launchpad.net/gnuflag"
 	"launchpad.net/rjson"
+	"launchpad.net/usso"
 )
 
 const helpMessage = `usage: http [flag...] [METHOD] URL [REQUEST_ITEM [REQUEST_ITEM...]]
@@ -95,6 +97,7 @@ type params struct {
 	basicAuth  string
 	cookieFile string
 	useStdin   bool
+	oauth      string
 	// TODO auth, verify, proxy, file, timeout
 
 	url     *url.URL
@@ -111,6 +114,7 @@ type context struct {
 	form      url.Values
 	jsonObj   map[string]interface{}
 	body      io.ReadSeeker
+	ssoData *usso.SSOData
 }
 
 var errUsage = errors.New("bad usage")
@@ -120,6 +124,8 @@ type keyVal struct {
 	sep string
 	val string
 }
+
+var visitWebPage func(url *url.URL) error
 
 func main() {
 	fset := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
@@ -159,6 +165,19 @@ func newContext(fset *flag.FlagSet, args []string) (*context, *params, error) {
 	if p.debug {
 		loggo.ConfigureLoggers("DEBUG")
 	}
+	var ssoData *usso.SSOData
+	if p.oauth != "" {
+		f, err := os.Open(p.oauth)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer f.Close()
+		dec := json.NewDecoder(f)
+		ssoData = &usso.SSOData{}
+		if err := dec.Decode(ssoData); err != nil {
+			return nil, nil, err
+		}
+	}
 	ctxt := &context{
 		url:       p.url,
 		method:    p.method,
@@ -166,6 +185,7 @@ func newContext(fset *flag.FlagSet, args []string) (*context, *params, error) {
 		urlValues: make(url.Values),
 		form:      make(url.Values),
 		jsonObj:   make(map[string]interface{}),
+		ssoData: ssoData,
 	}
 	for _, kv := range p.keyVals {
 		if err := ctxt.addKeyVal(p, kv); err != nil {
@@ -214,6 +234,7 @@ func parseArgs(fset *flag.FlagSet, args []string) (*params, error) {
 
 	fset.BoolVar(&p.useStdin, "stdin", false, "read request body from standard input")
 
+	fset.StringVar(&p.oauth, "oauth", "", "Ubuntu SSO OAuth token")
 	// TODO --file (multipart upload)
 	// TODO --timeout
 	// TODO --proxy
@@ -326,7 +347,10 @@ func (ctxt *context) doRequest(client *http.Client, stdin io.Reader) (*http.Resp
 	req.ContentLength = int64(len(body))
 	getBody := httpbakery.SeekerBody(bytes.NewReader(body))
 
-	resp, err := httpbakery.DoWithBody(client, req, getBody, visitWebPage)
+	resp, err := (&httpbakery.Client{
+		Client: client,
+		VisitWebPage: ctxt.visitWebPage,
+	}).DoWithBody(req, getBody)
 	if err != nil {
 		return nil, fmt.Errorf("cannot do HTTP request: %v", err)
 	}
@@ -387,8 +411,46 @@ func printHeaders(w io.Writer, h http.Header) {
 	}
 }
 
-func visitWebPage(url *url.URL) error {
-	fmt.Printf("please visit this URL:\n%s\n", url)
+func (ctxt *context) visitWebPage(u *url.URL) error {
+	if ctxt.ssoData == nil || u.Host != "login.ubuntu.com" {
+		fmt.Printf("please visit this URL:\n%s\n", u)
+		return nil
+	}
+	// Find the return_to address and sign it
+	rt := u.Query().Get("openid.return_to")
+	if rt == "" {
+		fmt.Printf("please visit this URL:\n%s\n", u)
+		return nil
+	}
+	rtu, err := url.Parse(rt)
+	if err != nil {
+		return err
+	}
+	base := *rtu
+	base.RawQuery = ""
+	client := &oauth.Client{
+		Credentials: oauth.Credentials{
+			Token: ctxt.ssoData.ConsumerKey,
+			Secret: ctxt.ssoData.ConsumerSecret,
+		},
+		SignatureMethod: oauth.HMACSHA1,
+	}
+	token := &oauth.Credentials{
+		Token: ctxt.ssoData.TokenKey,
+		Secret: ctxt.ssoData.TokenSecret,
+	}
+	r, err := http.NewRequest("GET", rt, nil)
+	if err != nil {
+		return err
+	}
+	if err := client.SetAuthorizationHeader(r.Header, token, r.Method, &base, rtu.Query()); err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(r)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
 	return nil
 }
 
