@@ -22,7 +22,7 @@ import (
 	"github.com/garyburd/go-oauth/oauth"
 	"github.com/juju/loggo"
 	"github.com/juju/persistent-cookiejar"
-	"gopkg.in/macaroon-bakery.v0/httpbakery"
+	"gopkg.in/macaroon-bakery.v1/httpbakery"
 	flag "launchpad.net/gnuflag"
 	"launchpad.net/rjson"
 	"launchpad.net/usso"
@@ -114,7 +114,7 @@ type context struct {
 	form      url.Values
 	jsonObj   map[string]interface{}
 	body      io.ReadSeeker
-	ssoData *usso.SSOData
+	ssoData   *usso.SSOData
 }
 
 var errUsage = errors.New("bad usage")
@@ -185,7 +185,7 @@ func newContext(fset *flag.FlagSet, args []string) (*context, *params, error) {
 		urlValues: make(url.Values),
 		form:      make(url.Values),
 		jsonObj:   make(map[string]interface{}),
-		ssoData: ssoData,
+		ssoData:   ssoData,
 	}
 	for _, kv := range p.keyVals {
 		if err := ctxt.addKeyVal(p, kv); err != nil {
@@ -345,10 +345,10 @@ func (ctxt *context) doRequest(client *http.Client, stdin io.Reader) (*http.Resp
 		body = data
 	}
 	req.ContentLength = int64(len(body))
-	getBody := httpbakery.SeekerBody(bytes.NewReader(body))
+	getBody := bytes.NewReader(body)
 
 	resp, err := (&httpbakery.Client{
-		Client: client,
+		Client:       client,
 		VisitWebPage: ctxt.visitWebPage,
 	}).DoWithBody(req, getBody)
 	if err != nil {
@@ -411,18 +411,45 @@ func printHeaders(w io.Writer, h http.Header) {
 	}
 }
 
+func loginProtocols(u *url.URL) (map[string]map[string]string, error) {
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return errors.New("no redirects")
+		},
+	}
+	req, err := http.NewRequest("GET", u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusBadRequest {
+		return nil, fmt.Errorf("Bad status: %s", resp.Status)
+	}
+	data, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var protocols map[string]map[string]string
+	err = json.Unmarshal(data, &protocols)
+	if err != nil {
+		return nil, err
+	}
+	return protocols, nil
+}
+
 func (ctxt *context) visitWebPage(u *url.URL) error {
-	if ctxt.ssoData == nil || u.Host != "login.ubuntu.com" {
+	// Attempt to get the options for non-interactive login
+	protocols, err := loginProtocols(u)
+	if err != nil || ctxt.ssoData == nil || protocols["usso"] == nil || protocols["usso"]["oauth11"] == "" {
 		fmt.Printf("please visit this URL:\n%s\n", u)
 		return nil
 	}
-	// Find the return_to address and sign it
-	rt := u.Query().Get("openid.return_to")
-	if rt == "" {
-		fmt.Printf("please visit this URL:\n%s\n", u)
-		return nil
-	}
-	rtu, err := url.Parse(rt)
+	rtu, err := url.Parse(protocols["usso"]["oauth11"])
 	if err != nil {
 		return err
 	}
@@ -430,16 +457,16 @@ func (ctxt *context) visitWebPage(u *url.URL) error {
 	base.RawQuery = ""
 	client := &oauth.Client{
 		Credentials: oauth.Credentials{
-			Token: ctxt.ssoData.ConsumerKey,
+			Token:  ctxt.ssoData.ConsumerKey,
 			Secret: ctxt.ssoData.ConsumerSecret,
 		},
 		SignatureMethod: oauth.HMACSHA1,
 	}
 	token := &oauth.Credentials{
-		Token: ctxt.ssoData.TokenKey,
+		Token:  ctxt.ssoData.TokenKey,
 		Secret: ctxt.ssoData.TokenSecret,
 	}
-	r, err := http.NewRequest("GET", rt, nil)
+	r, err := http.NewRequest("GET", protocols["usso"]["oauth11"], nil)
 	if err != nil {
 		return err
 	}
