@@ -445,11 +445,11 @@ func loginProtocols(u *url.URL) (map[string]map[string]string, error) {
 func (ctxt *context) visitWebPage(u *url.URL) error {
 	// Attempt to get the options for non-interactive login
 	protocols, err := loginProtocols(u)
-	if err != nil || ctxt.ssoData == nil || protocols["usso"] == nil || protocols["usso"]["oauth11"] == "" {
+	if err != nil || ctxt.ssoData == nil || protocols["usso"] == nil || protocols["usso"]["oauth10"] == "" {
 		fmt.Printf("please visit this URL:\n%s\n", u)
 		return nil
 	}
-	rtu, err := url.Parse(protocols["usso"]["oauth11"])
+	rtu, err := url.Parse(protocols["usso"]["oauth10"])
 	if err != nil {
 		return err
 	}
@@ -466,7 +466,7 @@ func (ctxt *context) visitWebPage(u *url.URL) error {
 		Token:  ctxt.ssoData.TokenKey,
 		Secret: ctxt.ssoData.TokenSecret,
 	}
-	r, err := http.NewRequest("GET", protocols["usso"]["oauth11"], nil)
+	r, err := http.NewRequest("GET", protocols["usso"]["oauth10"], nil)
 	if err != nil {
 		return err
 	}
